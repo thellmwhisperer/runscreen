@@ -365,7 +365,7 @@ func (m *Model) boxRows(out []paneLine, title string, rows []Row, path, parent s
 			open = m.unfolded(key)
 			marker = fold(open) + " "
 		}
-		texts, _, _ := m.textRows(indent+marker, indent+"  ", r.Text, width, codeFence{})
+		texts := m.textRows(indent+marker, indent+"  ", r.Text, width)
 		for j, text := range texts {
 			line := paneLine{key: key, parent: parent, text: text}
 			if j == 0 && len(r.Rows) > 0 {
@@ -463,7 +463,7 @@ func (m *Model) listRows(line string, width int) ([]string, bool) {
 // textRows is the Markdown of text in rows of a box width wide, the first behind prefix, the rest behind indent:
 // fenced code kept as is, hard wrapped, lists with their continuation under their text. Terminal controls are
 // stripped and tabs are expanded before they reach the terminal.
-func (m *Model) textRows(prefix, indent, text string, width int, code codeFence) ([]string, []int, codeFence) {
+func (m *Model) textRows(prefix, indent, text string, width int) []string {
 	text = strings.Map(func(r rune) rune {
 		if unicode.IsControl(r) && r != '\n' && r != '\t' {
 			return -1
@@ -472,12 +472,11 @@ func (m *Model) textRows(prefix, indent, text string, width int, code codeFence)
 	}, ansi.Strip(text))
 	w := max(1, width-4-max(ansi.StringWidth(prefix), ansi.StringWidth(indent)))
 	var rows []string
-	var sources []int
-	for source, line := range strings.Split(text, "\n") {
+	var code codeFence
+	for _, line := range strings.Split(text, "\n") {
 		var wrapped []string
 		wrapped, code = m.lineRows(line, w, code)
 		for _, l := range wrapped {
-			sources = append(sources, source)
 			if rows == nil {
 				rows = append(rows, prefix+l)
 			} else {
@@ -485,7 +484,7 @@ func (m *Model) textRows(prefix, indent, text string, width int, code codeFence)
 			}
 		}
 	}
-	return rows, sources, code
+	return rows
 }
 
 // lineRows is line in rows of width, inside the fenced code code, or after it; and the fence it leaves open.
@@ -522,8 +521,7 @@ func (m *Model) agentBox(width, lines int) string {
 		out, calls = m.toolLines(out, calls), nil
 		key := fmt.Sprintf("activity:%p", a)
 		if a.says != "" {
-			texts, _, _ := m.textRows("✎ ", "  ", a.says, width, codeFence{})
-			for _, text := range texts {
+			for _, text := range m.textRows("✎ ", "  ", a.says, width) {
 				out = append(out, paneLine{key: key, text: text})
 			}
 			continue
@@ -558,8 +556,7 @@ func (m *Model) thinkingLines(out []paneLine, key, thinking string, width int) [
 		first, _, _ := m.inline(oneLine(thinking))
 		return append(out, paneLine{key: key, toggle: key, text: fold(false) + " ∴ " + first})
 	}
-	texts, _, _ := m.textRows(fold(true)+" ∴ ", "  ", strings.TrimRight(thinking, "\n"), width, codeFence{})
-	for i, text := range texts {
+	for i, text := range m.textRows(fold(true)+" ∴ ", "  ", strings.TrimRight(thinking, "\n"), width) {
 		line := paneLine{key: key, text: text}
 		if i == 0 {
 			line.toggle = key
