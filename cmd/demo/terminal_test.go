@@ -105,7 +105,8 @@ func command(t *testing.T, args ...string) *exec.Cmd {
 		t.Fatal(err)
 	}
 	cmd := exec.Command(bin, args...)
-	cmd.Env = append(os.Environ(), "TERM=xterm-256color")
+	// CI emptied: termenv takes a set CI for a terminal that is no TTY, and the demo would then ask it nothing.
+	cmd.Env = append(os.Environ(), "TERM=xterm-256color", "CI=")
 	if dir := os.Getenv("E2E_COVERDIR"); dir != "" {
 		cmd.Env = append(cmd.Env, "GOCOVERDIR="+dir)
 	}
