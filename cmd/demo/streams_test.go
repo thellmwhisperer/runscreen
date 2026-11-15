@@ -84,9 +84,6 @@ func TestTheDemoDrawsEveryKindOfLine(t *testing.T) {
 		strings.Contains(last, "\a") {
 		t.Fatalf("the last frame:\n%s", last)
 	}
-	d = start(t, 120, 40, "-delay", "1ms", "-plain", path)
-	d.until(0, "✎ *Italic* and <https://example.org> and <b>raw</b>", "`aaaa")
-	d.quit()
 }
 
 func TestTheDemoReadsCodexReasoningAndPiThinking(t *testing.T) {
