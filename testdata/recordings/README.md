@@ -15,10 +15,12 @@ Every run got the same prompt:
 Each CLI ran without the user's instructions, skills, hooks or extensions. What was changed after recording:
 
 - the working directory reads `/work/runscreen` and the home directory `/home/user`;
-- in `claude.jsonl`, the hook events are dropped and the `init` event's lists of skills, commands, agents, plugins and MCP servers are emptied.
+- in `claude.jsonl`, the hook events and the account's `rate_limit_event` are dropped, the `result` event loses `credential_expires_at`, and the `init` event's lists of skills, commands, agents, plugins and MCP servers are emptied.
 
 What each recording holds:
 
-- `claude.jsonl`: thinking, three tool calls with their results, and the final text.
+- `claude.jsonl`: one thinking block with its signature and empty text (the CLI printed no thinking text), three tool calls with their results, and the final text.
 - `codex.jsonl`: two command executions and the agent's messages. Codex printed no reasoning items in this run.
 - `pi.jsonl`: streamed text, three tool calls with their results. pi printed no thinking in this run.
+
+No recording carries thinking text, so a test of how thinking is drawn and folded feeds its own events.
