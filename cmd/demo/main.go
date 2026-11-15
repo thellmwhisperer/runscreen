@@ -28,7 +28,6 @@ func run(args []string, in io.Reader, out io.Writer) error {
 	fs.StringVar(&agent.Model, "model", "", "the agent's model; by default, the one its stream names")
 	fs.StringVar(&agent.Effort, "effort", "", "the agent's effort")
 	delay := fs.Duration("delay", 300*time.Millisecond, "the time between two lines of the recording")
-	plain := fs.Bool("plain", false, "show what the agent says as written, without rendering its Markdown")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
@@ -40,8 +39,6 @@ func run(args []string, in io.Reader, out io.Writer) error {
 		return err
 	}
 	m := runscreen.New(80, 24)
-	if !*plain {
-		m.SetMarkdown(markdown.Inline)
-	}
+	m.SetMarkdown(markdown.Inline)
 	return runscreen.Show(m, in, out, r.play)
 }
