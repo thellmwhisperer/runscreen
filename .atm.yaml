@@ -1,0 +1,11 @@
+# ATM's configuration for this repository.
+# Every key is required; an empty value is a deliberate "none".
+install: go mod download
+test: sh scripts/test.sh
+e2e: ''
+typecheck: go vet ./...
+lint: sh scripts/lint.sh
+test_file: go test -count=1 -run {tests} {dir}
+test_patterns: ["**/*_test.go", "**/testdata/**"]
+docs_patterns: ["**/*.md", "docs/**"]
+delivery: sh scripts/deliver.sh
