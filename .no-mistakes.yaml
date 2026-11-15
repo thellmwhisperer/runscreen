@@ -1,0 +1,21 @@
+commands:
+  test: sh scripts/test.sh
+  lint: sh scripts/lint.sh
+review:
+  path_instructions:
+    - path: "**"
+      instructions: |
+        A finding is a defect against the linked issue's acceptance criteria, or one that breaks
+        the repository's test, typecheck or lint commands. Hardening for a case the issue does
+        not name is reported as a note and changes nothing.
+auto_fix:
+  review: 0  # the reviewer only reports; whoever launched the run answers every finding
+ci:
+  rerun_transient: 1
+commit:
+  fix_message: "gate({{.Step}}): {{.Summary}}"
+# The PR body is the repository's template plus one risk line and the gate's signature.
+pr:
+  template: .github/pull_request_template.md
+  publish_intent: false
+  appendix: minimal
