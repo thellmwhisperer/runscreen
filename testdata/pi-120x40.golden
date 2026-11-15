@@ -1,0 +1,39 @@
+╭─ Pipeline ───────────────────────────╮  ╭─ Agent · pi · openai-codex/gpt-6.1-sol · high* ────────────────────────────╮
+│ ▸ pi.jsonl: a recorded pi … ✓ passed │  │                                                                            │
+│                                      │  │                                                                            │
+│ ✓ Read pi.jsonl  0.0 s 106… · passed │  │                                                                            │
+│ │                                    │  │                                                                            │
+│ ✓ Replay pi's st…  1 min 45 s passed │  │                                                                            │
+│   ✓ read doc.go  5.0 s // … · passed │  │                                                                            │
+│   ✓ read .golangci.yml  6.0 s passed │  │                                                                            │
+│   ✓ bash go vet ./...  7.0 s  passed │  │                                                                            │
+│ │                                    │  │                                                                            │
+│ ✓ Show the last frame  0.0 s  passed │  │                                                                            │
+╰──────────────────────────────────────╯  │                                                                            │
+                                          │                                                                            │
+                                          │                                                                            │
+                                          │                                                                            │
+                                          │                                                                            │
+                                          │                                                                            │
+                                          │                                                                            │
+                                          │                                                                            │
+                                          │                                                                            │
+                                          │                                                                            │
+                                          │                                                                            │
+                                          │                                                                            │
+                                          │                                                                            │
+                                          │                                                                            │
+                                          │ ▸ · 3 tools: read ×2, bash                                                 │
+                                          │ ✎ • go vet ./... passed with no diagnostics.                               │
+                                          │   • gocyclo matters most: limiting branching complexity helps keep         │
+                                          │     terminal rendering logic predictable and testable.                     │
+                                          │   • funlen is next: shorter functions help separate pipeline layout and    │
+                                          │     event rendering. Both matter more than lll, which primarily enforces   │
+                                          │     formatting.                                                            │
+                                          ╰────────────────────────────────────────────────────────────────────────────╯
+                                          ╭─ Recording ────────────────────────────────────────────────────────────────╮
+                                          │   106 of 106 lines read                                                    │
+                                          │ ▸ Line types (12)                                                          │
+                                          ╰────────────────────────────────────────────────────────────────────────────╯
+
+  q quit  t show tool use  h show thinking

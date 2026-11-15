@@ -1,0 +1,23 @@
+╭─ Pipeline ───────────────────────────────────────────────────────────────────╮
+│ codex.jsonl: a recorded codex run, replayed line by line            ✓ passed │
+│                                                                              │
+│ ✓ Read codex.jsonl  0.0 s                                   9 lines · passed │
+│ ✓ Replay codex's stream  8.0 s                              2 tools · passed │
+│   ✓ shell /bin/bash -lc 'cat doc.go .golangci.yml'  1.0 s // Packa… · passed │
+│   ✓ shell /bin/bash -lc 'pwd; rg --files -g AGENTS.md -g go.m…  1.0 s passed │
+│ ✓ Show the last frame  0.0 s                                          passed │
+╰──────────────────────────────────────────────────────────────────────────────╯
+╭─ Agent · codex · gpt-6.1-sol · high* ────────────────────────────────────────╮
+│   • gocyclo matters most: complex rendering branches make pipeline steps and │
+│     agent events harder to reason about; the configured threshold is 15.     │
+│   • funlen comes next: shorter rendering functions keep layout logic easier  │
+│      to maintain and test. For this terminal UI, that matters more than lll’ │
+│     s                                                                        │
+│      line-length checks.                                                     │
+╰──────────────────────────────────────────────────────────────────────────────╯
+╭─ Recording ──────────────────────────────────────────────────────────────────╮
+│   9 of 9 lines read                                                          │
+│ ▸ Line types (5)                                                             │
+╰──────────────────────────────────────────────────────────────────────────────╯
+
+  q quit  t show tool use  h show thinking
