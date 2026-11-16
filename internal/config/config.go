@@ -1,0 +1,238 @@
+// Package config is ATM's configuration in layers, each overriding the one before (#150 point 5): the
+// built-in defaults, ~/.config/atm/config.yaml, the repository's .atm.yaml, then the flags of one run.
+package config
+
+import (
+	"bytes"
+	"cmp"
+	"errors"
+	"fmt"
+	"io"
+	"io/fs"
+	"maps"
+	"os"
+	"os/exec"
+	"path/filepath"
+	"regexp"
+	"slices"
+	"strings"
+
+	"gopkg.in/yaml.v3"
+	"mvdan.cc/sh/v3/expand"
+	"mvdan.cc/sh/v3/syntax"
+)
+
+// Agent is the agent selection shared by configuration layers. Empty model or effort: the harness's default.
+type Agent struct {
+	Harness string `yaml:"harness"`
+	Model   string `yaml:"model"`
+	Effort  string `yaml:"effort"`
+}
+
+// Config is the repository configuration. Nothing in it is per language: the repository declares its commands.
+type Config struct {
+	Agent        `yaml:",inline"`
+	Install      string   `yaml:"install"`
+	Test         string   `yaml:"test"`
+	E2E          string   `yaml:"e2e"`
+	Compile      string   `yaml:"compile"` // optional: preflight runs it on the base tree; non-zero stops the launch
+	Typecheck    string   `yaml:"typecheck"`
+	Lint         string   `yaml:"lint"`
+	TestFile     string   `yaml:"test_file"` // legacy required key, validated but not executed
+	TestPatterns []string `yaml:"test_patterns"`
+	DocsPatterns []string `yaml:"docs_patterns"`
+	Delivery     string   `yaml:"delivery"`
+	Ponytail     bool     `yaml:"ponytail"` // optional, true by default
+	// Retired keys: a .atm.yaml that still has them loads, and they limit nothing.
+	RetiredAgentTimeout any `yaml:"agent_timeout"`
+	RetiredCheckTimeout any `yaml:"check_timeout"`
+}
+
+// ACP is the agents ATM speaks ACP with, by harness: the command line it runs in the clone, and, since it takes
+// its model and effort from its own config, the error either fails the run with (rule 8).
+var ACP = map[string]struct {
+	Argv  []string
+	Unset string
+}{
+	"hermes": {[]string{"hermes", "--ignore-rules", "acp"},
+		"hermes takes model and effort from its own config; unset them in .atm.yaml"},
+}
+
+// required is every key .atm.yaml must declare; an empty value is a deliberate "none".
+var required = []string{"install", "test", "typecheck", "lint", "test_file", "test_patterns", "docs_patterns",
+	"delivery"}
+
+// machine is ~/.config/atm/config.yaml: the agent, screen and repository fallbacks. Other keys land in Unknown.
+type machine struct {
+	Harness, Model, Effort string
+	Screen                 string
+	RepositoryOverrides    map[string]yaml.Node `yaml:"repository_overrides"`
+	Unknown                map[string]any       `yaml:",inline"`
+}
+
+// readMachine reads home's config.yaml. A project key there is an error; any other key it does not know is
+// ignored, named once on stderr, so a retired key never breaks a machine.
+func readMachine(home string) (machine, error) {
+	m := machine{Harness: "claude"}
+	path := filepath.Join(home, ".config", "atm", "config.yaml")
+	keys, err := decode(path, &m)
+	if err != nil {
+		return m, err
+	}
+	if _, set := keys["screen"]; set && m.Screen != "close" && m.Screen != "keep" {
+		return m, fmt.Errorf("%s: screen %q: want close or keep", path, m.Screen)
+	}
+	for _, k := range slices.Sorted(maps.Keys(m.Unknown)) {
+		if slices.Contains(required, k) || k == "agent_timeout" || k == "check_timeout" {
+			return m, fmt.Errorf("%s: %s is a project key: put it in .atm.yaml", path, k)
+		}
+		fmt.Fprintln(os.Stderr, "config: ignored key", k)
+	}
+	return m, nil
+}
+
+// KeepScreen says whether home's machine config keeps the screen open after the run and gate end.
+func KeepScreen(home string) (bool, error) {
+	m, err := readMachine(home)
+	return m.Screen == "keep", err
+}
+
+// Load is the defaults, overridden by home's .config/atm/config.yaml, root's .atm.yaml and the non-empty
+// fields of flags.
+func Load(root, home string, flags Agent) (Config, error) {
+	project := filepath.Join(root, ".atm.yaml")
+	if _, err := os.Stat(project); errors.Is(err, fs.ErrNotExist) {
+		return MachineRepo(root, home, flags)
+	}
+	return load(project, home, flags, func(c *Config, _ machine) (map[string]any, error) { return decode(project, c) })
+}
+
+// Parse is Load with b as .atm.yaml, which project names.
+func Parse(project string, b []byte, home string, flags Agent) (Config, error) {
+	return load(project, home, flags, func(c *Config, _ machine) (map[string]any, error) {
+		return decodeBytes(project, b, c)
+	})
+}
+
+var originRepository = regexp.MustCompile(`[:/]([^/:]+/[^/]+?)(?:\.git)?/?$`)
+
+// MachineRepo loads origin's owner/name entry from the machine's repository_overrides when no project file exists.
+func MachineRepo(root, home string, flags Agent) (Config, error) {
+	path := filepath.Join(home, ".config", "atm", "config.yaml")
+	origin, _ := exec.Command("git", "-C", root, "remote", "get-url", "origin").Output()
+	key := ""
+	if match := originRepository.FindStringSubmatch(strings.TrimSpace(string(origin))); match != nil {
+		key = match[1]
+	}
+	project := path + " repository_overrides." + key
+	return load(project, home, flags, func(c *Config, m machine) (map[string]any, error) {
+		if key == "" {
+			return nil, fmt.Errorf("config incomplete: no .atm.yaml, and origin names no owner/name "+
+				"to look up in %s repository_overrides", path)
+		}
+		node, ok := m.RepositoryOverrides[key]
+		if !ok {
+			return nil, fmt.Errorf("config incomplete: no .atm.yaml, and %s has no repository_overrides entry for %s",
+				path, key)
+		}
+		b, _ := yaml.Marshal(node) // Nodes decoded from YAML can be marshalled back to YAML.
+		return decodeBytes(project, b, c)
+	})
+}
+
+// load is Load with .atm.yaml, which project names, decoded over its argument by decodeProject.
+func load(project, home string, flags Agent,
+	decodeProject func(*Config, machine) (map[string]any, error)) (Config, error) {
+	m, err := readMachine(home)
+	if err != nil {
+		return Config{}, err
+	}
+	c := Config{Agent: Agent{Harness: m.Harness, Model: m.Model, Effort: m.Effort}, Ponytail: true}
+	keys, err := decodeProject(&c, m)
+	if err != nil {
+		return c, err
+	}
+	var missing []string
+	for _, k := range required {
+		if _, ok := keys[k]; !ok {
+			missing = append(missing, k)
+		}
+	}
+	if len(missing) > 0 {
+		return c, fmt.Errorf("config incomplete: %s lacks %s", project, strings.Join(missing, ", "))
+	}
+	if c.TestFile != "" && !strings.Contains(c.TestFile, "{file}") && !strings.Contains(c.TestFile, "{dir}") {
+		return c, fmt.Errorf("test_file %q: want {file} or {dir} in it", c.TestFile)
+	}
+	if err := deliveryError(project, c.Delivery); err != nil {
+		return c, err
+	}
+	c.Harness, c.Model, c.Effort = cmp.Or(flags.Harness, c.Harness), cmp.Or(flags.Model, c.Model),
+		cmp.Or(flags.Effort, c.Effort)
+	return c, harnessError(c.Agent)
+}
+
+// deliveryError rejects a second gate screen; comments and arguments naming it are ordinary shell text.
+func deliveryError(project, line string) error {
+	file, err := syntax.NewParser().Parse(strings.NewReader(line), "")
+	if err != nil {
+		return nil // Shell syntax errors still belong to delivery's shell.
+	}
+	var refusal error
+	syntax.Walk(file, func(node syntax.Node) bool {
+		call, ok := node.(*syntax.CallExpr)
+		if !ok || len(call.Args) < 2 {
+			return true
+		}
+		command, _ := expand.Literal(nil, call.Args[0])
+		subcommand, _ := expand.Literal(nil, call.Args[1])
+		if filepath.Base(command) == "no-mistakes" && subcommand == "attach" {
+			refusal = fmt.Errorf("%s: delivery: no-mistakes attach opens a second screen; "+
+				"replace it with no-mistakes axi run to launch the run; ATM paints the gate", project)
+		}
+		return true
+	})
+	return refusal
+}
+
+// harnessError is why a's harness cannot run as a sets it, nil when it can.
+func harnessError(a Agent) error {
+	acp, isACP := ACP[a.Harness]
+	switch {
+	case !slices.Contains([]string{"claude", "codex", "opencode", "pi", "cursor"}, a.Harness) && !isACP:
+		return fmt.Errorf("harness %q unknown, want claude, codex, opencode, pi, cursor or hermes", a.Harness)
+	case isACP && (a.Model != "" || a.Effort != ""):
+		return errors.New(acp.Unset)
+	case a.Harness == "cursor" && a.Effort != "":
+		return fmt.Errorf("cursor has no effort flag: put it in the model, as '<model>[effort=%s]'", a.Effort)
+	case a.Harness == "opencode" && a.Effort != "" && a.Model == "":
+		return fmt.Errorf("opencode sets effort through the model: use '<provider/model>#%s'", a.Effort)
+	}
+	return nil
+}
+
+// decode decodes the file at path, if any, over v and returns its top-level keys. A key v lacks is an error.
+func decode(path string, v any) (map[string]any, error) {
+	b, err := os.ReadFile(path)
+	if errors.Is(err, fs.ErrNotExist) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	return decodeBytes(path, b, v)
+}
+
+// decodeBytes is decode with b as the file at path.
+func decodeBytes(path string, b []byte, v any) (map[string]any, error) {
+	keys := map[string]any{}
+	dec := yaml.NewDecoder(bytes.NewReader(b))
+	dec.KnownFields(true)
+	if err := dec.Decode(v); err != nil && !errors.Is(err, io.EOF) {
+		return nil, fmt.Errorf("%s: %w", path, err)
+	}
+	if err := yaml.Unmarshal(b, &keys); err != nil {
+		return nil, fmt.Errorf("%s: %w", path, err)
+	}
+	return keys, nil
+}

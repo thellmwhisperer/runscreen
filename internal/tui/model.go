@@ -1,0 +1,673 @@
+// Package tui is a run's screen on a terminal, with a row for each node of ATM's graph.
+package tui
+
+import (
+	"encoding/json"
+	"fmt"
+	"slices"
+	"strings"
+	"time"
+
+	tea "github.com/charmbracelet/bubbletea"
+	"github.com/charmbracelet/x/ansi"
+
+	"github.com/thellmwhisperer/runscreen/internal/run"
+)
+
+// row is a row of the ATM box: a node of the graph, or, when check, a command of the node before.
+type row struct {
+	step, label, state, note string // state's icon and colour are in states
+	by                       string // approval attribution for the Checks row
+	check                    bool
+	start                    time.Time
+	took                     time.Duration
+	hasDuration              bool
+}
+
+// activity is a line of the Agent box: a tool call, by its id, its result and the first line of its output, or
+// what the agent says, with the report it ends with, or thinks.
+type activity struct {
+	id, tool, detail, result, summary, thinking, says string
+	report                                            *report
+}
+
+// report is the report the agent's message ends with: its summary in Markdown, the files it changed, the commands
+// it ran, its test and its findings.
+type report struct {
+	Summary      string
+	TestFile     string   `json:"test_file"`
+	ChangedFiles []string `json:"changed_files"`
+	CommandsRun  []string `json:"commands_run"`
+	Findings     []struct{ Severity, File, Description string }
+}
+
+// logLine is a line of the Log box: what the command check, or else node step, printed.
+type logLine struct {
+	step, check, text string
+	code              codeFence
+}
+
+type codeFence struct {
+	marker byte
+	length int
+}
+
+// finding is a row of the Findings box, with a severity, error or warning, a reference and
+// a description.
+type finding struct {
+	severity, ref, text string
+}
+
+// Model is a run's screen: what the run's frames said so far, drawn at the terminal's size.
+type Model struct {
+	label, title, state           string
+	agentLabel                    string // " · " and the agent's harness, model and, when set, effort
+	number                        int
+	rows                          []*row
+	agent                         []*activity
+	output                        []*logLine
+	findings                      []finding
+	width, height, spin           int
+	historyHeight                 int
+	now                           time.Time
+	done, detached                bool
+	keepScreen                    bool // screen: keep leaves the completed screen interactive until q or Ctrl+C
+	outcome                       run.Outcome
+	err                           error
+	pipeline, history, log        pane
+	findingsPane                  pane
+	focus                         *pane // the box tab moved to, while it shows
+	pipelineBounds, historyBounds bounds
+	logBounds, findingsBounds     bounds
+	titleArrow                    bounds
+	unfold                        bool // t: every tool call of the Agent box on its own line
+	unfoldThink                   bool // h: every thinking message of the Agent box in full
+	unfoldTitle                   bool // i: every line of the issue's title
+	// tool calls, thinking, output or report rows, by key,
+	// clicked open or closed
+	open             map[string]bool
+	clone            string     // the run's clone, where the gate after Delivery is asked
+	gateSteps        []gateStep // the gate's steps, once the gate shows a run
+	gateLive         bool       // the gate goes on after the run's end, so the screen's clock keeps ticking
+	asking           bool       // the screen asks no-mistakes for the gate, until a gate over after the run's end
+	gateAnswered     bool       // no-mistakes has answered the screen's first question about the gate
+	typing, aborting bool       // the footer takes a line for the gate, or asks to confirm its abort
+	fixSelected      bool
+	answered         []string
+	text             string // the line typed for the gate so far
+}
+
+type bounds struct{ x, y, width, height int }
+
+type paneLine struct{ key, parent, text, toggle string }
+
+type pane struct {
+	top, last, h, part int
+	anchor, parent     string
+	held               bool
+	toggles            []string // what each shown row opens or closes on a click
+}
+
+func (p *pane) show(lines []paneLine, h int) []string {
+	oldAnchor, oldParent, oldPart, oldTop := p.anchor, p.parent, p.part, p.top
+	p.h, p.last = h, max(0, len(lines)-h)
+	if p.held && oldAnchor != "" {
+		p.top = keyedLine(lines, oldAnchor, oldPart)
+		if p.top < 0 && oldParent != "" {
+			p.top = keyedLine(lines, oldParent, 0)
+		}
+		if p.top < 0 {
+			p.top = min(oldTop, p.last)
+		}
+	}
+	if !p.held || p.top >= p.last {
+		p.top, p.held = p.last, false
+	}
+	if p.top < len(lines) {
+		p.anchor, p.parent = lines[p.top].key, lines[p.top].parent
+		p.part = countKey(lines, p.top, lines[p.top].key)
+	}
+	out := make([]string, 0, min(h, len(lines)-p.top))
+	p.toggles = p.toggles[:0]
+	for _, line := range lines[p.top:min(len(lines), p.top+h)] {
+		out = append(out, line.text)
+		p.toggles = append(p.toggles, line.toggle)
+	}
+	return out
+}
+
+func keyedLine(lines []paneLine, key string, part int) int {
+	first, count := -1, 0
+	for i, line := range lines {
+		if line.key == key {
+			if first < 0 {
+				first = i
+			}
+			count++
+		}
+	}
+	if first < 0 {
+		return -1
+	}
+	return first + min(part, count-1)
+}
+
+func countKey(lines []paneLine, at int, key string) int {
+	n := 0
+	for i := at - 1; i >= 0 && lines[i].key == key; i-- {
+		n++
+	}
+	return n
+}
+
+func (p *pane) scroll(n int) {
+	p.top = min(max(0, p.top+n), p.last)
+	p.held = p.top < p.last
+	p.anchor, p.parent, p.part = "", "", 0
+}
+
+// focused is the pane keys scroll: the box tab moved to while it shows, else the Agent box's while it shows, else
+// the ATM box's.
+func (m *Model) focused() *pane {
+	if slices.Contains(m.panes(), m.focus) {
+		return m.focus
+	}
+	if m.agentVisible() || m.gateSteps != nil {
+		return &m.history
+	}
+	return &m.pipeline
+}
+
+// panes is the panes of the boxes shown, in the order tab moves through them.
+func (m *Model) panes() []*pane {
+	shown := []*pane{&m.pipeline}
+	if m.agentVisible() || m.gateSteps != nil {
+		shown = append(shown, &m.history)
+	}
+	if m.showRunFindings() || m.gateSteps == nil && !m.agentRuns() && len(m.findings) > 0 {
+		shown = append(shown, &m.findingsPane)
+	}
+	if m.gateSteps == nil && (m.agentRuns() && len(m.output) > 0 || !m.agentRuns() && m.running()) {
+		shown = append(shown, &m.log)
+	}
+	return shown
+}
+
+// New is the screen of run label before its first frame, every node pending.
+func New(label string, width, height int) *Model {
+	m := &Model{label: label, state: "waiting", width: width, height: height, now: time.Now()}
+	for _, n := range [][2]string{{"issue", "Issue"}, {"clone", "Clone"}, {"contract", "Contract"},
+		{"agent", "Agent"}, {"checks", "Checks"}, {"ponytail", "Slop detector"}, {"delivery", "Delivery"}} {
+		m.rows = append(m.rows, &row{step: n[0], label: n[1], state: "pending"})
+	}
+	return m
+}
+
+type tick time.Time
+
+// ended is the run's end, as Follow returns it.
+type ended struct {
+	o   run.Outcome
+	err error
+}
+
+func (m *Model) Init() tea.Cmd {
+	if m.done && m.gateSteps == nil {
+		return m.autoQuit()
+	}
+	if m.done && m.gateLive && m.clone != "" {
+		m.asking = true
+		return tea.Batch(next(), m.ask(0))
+	}
+	return next()
+}
+
+func next() tea.Cmd {
+	return tea.Tick(100*time.Millisecond, func(t time.Time) tea.Msg { return tick(t) })
+}
+
+func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
+	switch msg := msg.(type) {
+	case tea.WindowSizeMsg:
+		m.width, m.height = msg.Width, msg.Height
+	case tea.KeyMsg:
+		if cmd, ok := m.gateKey(msg); ok {
+			return m, cmd
+		}
+		if slices.Contains([]string{"q", "ctrl+c"}, msg.String()) {
+			m.detached = !m.done
+			return m, tea.Quit
+		}
+		m.key(msg.String())
+	case tea.MouseMsg:
+		m.wheel(msg)
+	case tick:
+		return m, m.tick(msg)
+	case run.Frame:
+		return m, m.frame(msg)
+	case run.Outcome:
+		m.state = "waiting"
+	case ended:
+		return m, m.runEnded(msg)
+	case gateAnswer:
+		m.answered = append(m.answered, string(msg))
+	case gate:
+		return m, m.gateShown(msg)
+	}
+	return m, nil
+}
+
+// tick advances the clock while the run or the gate goes on, and ticks again while the run goes on or the screen asks.
+func (m *Model) tick(t tick) tea.Cmd {
+	if !m.done || m.gateLive {
+		m.now, m.spin = time.Time(t), m.spin+1
+	}
+	if !m.done || m.asking {
+		return next()
+	}
+	return nil
+}
+
+// frame reads frame f and starts asking for the gate the first time Delivery runs with the clone known.
+func (m *Model) frame(f run.Frame) tea.Cmd {
+	m.apply(f)
+	if d := m.current("delivery"); m.asking || m.clone == "" || d == nil || d.state != "running" {
+		return nil
+	}
+	m.asking = true
+	return m.ask(0)
+}
+
+// runEnded records the run's end, then applies the screen choice unless it is still asking for the gate.
+func (m *Model) runEnded(e ended) tea.Cmd {
+	m.end(e.o, e.err)
+	if m.asking {
+		return nil
+	}
+	return m.autoQuit()
+}
+
+// gateShown shows answer g and asks again after a second, unless g, asked after the run's end, shows a gate over,
+// or no gate run when none ever showed; either applies the screen choice.
+func (m *Model) gateShown(g gate) tea.Cmd {
+	m.gateAnswered = true
+	if g.ok {
+		m.gate(g)
+		if g.over && g.afterEnd {
+			m.asking = false
+			return m.autoQuit()
+		}
+	} else if g.afterEnd && m.gateSteps == nil {
+		m.asking = false
+		return m.autoQuit()
+	}
+	return m.ask(time.Second)
+}
+
+func (m *Model) autoQuit() tea.Cmd {
+	if m.keepScreen {
+		return nil
+	}
+	return tea.Quit
+}
+
+// key scrolls the focused box, or, on tab, focuses the next, or, on t, folds or unfolds every tool call,
+// on h, every thinking message and, on i, the issue's title.
+func (m *Model) key(k string) {
+	p := m.focused()
+	switch k {
+	case "t":
+		m.unfold, m.open = !m.unfold, nil
+	case "h":
+		m.unfoldThink, m.open = !m.unfoldThink, nil
+	case "i":
+		m.unfoldTitle = !m.unfoldTitle
+	case "tab":
+		shown := m.panes()
+		m.focus = shown[(slices.Index(shown, p)+1)%len(shown)]
+	case "up":
+		p.scroll(-1)
+	case "down":
+		p.scroll(1)
+	case "pgup":
+		p.scroll(-max(1, p.h-1))
+	case "pgdown":
+		p.scroll(max(1, p.h-1))
+	case "home":
+		p.scroll(-p.top)
+	case "end":
+		p.scroll(p.last)
+	}
+}
+
+// wheel scrolls the box under the pointer: ATM, Agent, Findings or Log while each shows. A click on a row of
+// folded tool calls, thinking, command output or report unfolds it, and on its first row once unfolded folds it again.
+func (m *Model) wheel(msg tea.MouseMsg) {
+	p, b := &m.pipeline, m.pipelineBounds
+	switch {
+	case m.findingsBounds.contains(msg.X, msg.Y):
+		p, b = &m.findingsPane, m.findingsBounds
+	case m.historyBounds.contains(msg.X, msg.Y):
+		p, b = &m.history, m.historyBounds
+	case m.logBounds.contains(msg.X, msg.Y):
+		p, b = &m.log, m.logBounds
+	case !m.pipelineBounds.contains(msg.X, msg.Y):
+		return
+	}
+	switch {
+	case msg.Button == tea.MouseButtonWheelUp:
+		p.scroll(-3)
+	case msg.Button == tea.MouseButtonWheelDown:
+		p.scroll(3)
+	case msg.Button == tea.MouseButtonLeft && msg.Action == tea.MouseActionPress:
+		if p == &m.pipeline && m.titleArrow.contains(msg.X-b.x, msg.Y-b.y) {
+			m.unfoldTitle = !m.unfoldTitle
+		}
+		row := msg.Y - b.y - 1 // under the box's top border
+		if row >= 0 && row < len(p.toggles) && p.toggles[row] != "" {
+			if m.open == nil {
+				m.open = map[string]bool{}
+			}
+			m.open[p.toggles[row]] = !m.unfolded(p.toggles[row])
+		}
+	}
+}
+
+// unfolded says whether the run of tool calls, the thinking message, the command output or the report's row by key
+// shows in full; command output does while its command runs, a report does, its rows under it do not.
+func (m *Model) unfolded(key string) bool {
+	if open, ok := m.open[key]; ok {
+		return open
+	}
+	if part, ok := strings.CutPrefix(key, "report:"); ok {
+		return !strings.Contains(part, ":")
+	}
+	if command, ok := strings.CutPrefix(key, "log:"); ok {
+		step, check, _ := strings.Cut(command, "/")
+		return m.command(step, check).state == "running"
+	}
+	if strings.HasPrefix(key, "tools:") {
+		return m.unfold
+	}
+	return m.unfoldThink
+}
+
+func (b bounds) contains(x, y int) bool {
+	return x >= b.x && x < b.x+b.width && y >= b.y && y < b.y+b.height
+}
+
+// event is every field of a node's or a live event the screen reads.
+type event struct {
+	Step, State, Error, TS, Title, Type, SHA, Branch string
+	Check, ID, Tool, Detail, Result, Summary         string
+	Thinking, Says, Message, Clone, Note             string
+	Answer, By, Node                                 string
+	ResumedFrom                                      string `json:"resumed_from"`
+	Output                                           *string
+	Number                                           int
+	DurationMS                                       int64 `json:"duration_ms"`
+	Kept                                             bool
+	Agent                                            *run.AgentSettings
+	PonytailSkipped                                  bool `json:"ponytail_skipped"`
+	Report                                           json.RawMessage
+	Verdicts                                         []struct{ File, Finding, Verdict string }
+}
+
+// apply reads frame f, when it carries an event: a node's start or end, or what happens inside it.
+func (m *Model) apply(f run.Frame) {
+	var e event
+	if f.Event == nil || json.Unmarshal(f.Event, &e) != nil {
+		return
+	}
+	at, _ := time.Parse(time.RFC3339Nano, e.TS)
+	m.settings(e.Agent)
+	m.skipPonytail(e.PonytailSkipped)
+	switch {
+	case e.Step == "decision":
+		m.decision(e)
+	case e.ID != "" || e.Tool != "":
+		m.tool(e)
+	case e.Thinking != "" || e.Says != "":
+		m.agent = append(m.agent, &activity{thinking: e.Thinking, says: e.Says})
+	case e.Output != nil:
+		m.appendOutput(e)
+	case m.current(e.Step) == nil:
+		return
+	case e.Check != "":
+		r := m.checkRow(e.Step, e.Check)
+		r.state, r.took, r.start, r.hasDuration = e.State, time.Duration(e.DurationMS)*time.Millisecond, at, true
+		r.note = e.Note
+		if e.State == "started" {
+			r.state = "running"
+		}
+	case e.State == "started":
+		m.started(e.Step, at)
+	case e.State != "":
+		m.ended(e)
+	}
+	if m.running() {
+		m.state = "running"
+	}
+}
+
+func (m *Model) skipPonytail(skip bool) {
+	if skip {
+		m.rows = slices.DeleteFunc(m.rows, func(r *row) bool { return r.step == "ponytail" })
+	}
+}
+
+// appendOutput adds a line of a node's output to the Log box; the delivery command's stays in the run's log, off
+// the screen.
+func (m *Model) appendOutput(e event) {
+	if e.Step == "delivery" {
+		return
+	}
+	line := &logLine{step: e.Step, check: e.Check, text: ansi.Strip(*e.Output)}
+	if len(m.output) > 0 {
+		previous := m.output[len(m.output)-1]
+		if previous.step == line.step && previous.check == line.check {
+			_, _, line.code = agentTextRows("", previous.text, m.width, previous.code)
+		}
+	}
+	m.output = append(m.output[max(0, len(m.output)-199):], line)
+}
+
+// decision shows a run waiting for its launcher's answer as one finding: what failed, in its first line, and how
+// to answer, in its last; the failed command's output stays in the run's report.
+func (m *Model) decision(e event) {
+	m.findings = slices.DeleteFunc(m.findings, func(f finding) bool { return f.ref == "Decision" })
+	if e.State == "answered" && e.Answer == "approve" && e.Node == "checks" {
+		m.approveChecks(e.By)
+	}
+	if e.State == "waiting" {
+		lines := strings.Split(e.Message, "\n")
+		text := lines[0]
+		if len(lines) > 1 {
+			text += "\n" + lines[len(lines)-1]
+		}
+		m.findings = append(m.findings, finding{"warning", "Decision", text})
+	}
+}
+
+func (m *Model) approveChecks(by string) {
+	for _, r := range m.rows {
+		if r.step == "checks" && r.state == "failed" {
+			if !r.check {
+				ref := m.failedAt(r)
+				m.findings = slices.DeleteFunc(m.findings, func(f finding) bool {
+					return f.severity == "error" && f.ref == ref
+				})
+				r.by = "by " + by
+			}
+			r.state = "approved"
+		}
+	}
+}
+
+func (m *Model) showRunFindings() bool {
+	return m.done && m.outcome.Outcome == "failed" && m.outcome.Reason != "" ||
+		slices.ContainsFunc(m.findings, func(f finding) bool { return f.ref == "Decision" })
+}
+
+// settings names agent a, when the event carries it, in the Agent box's title.
+func (m *Model) settings(a *run.AgentSettings) {
+	if a == nil {
+		return
+	}
+	m.agentLabel = " · " + run.Outcome{Agent: a}.AgentLabel()
+	if a.Effort != "" {
+		m.agentLabel += " · " + a.Effort
+	}
+}
+
+// current is the last row of node step.
+func (m *Model) current(step string) *row {
+	for i := len(m.rows) - 1; i >= 0; i-- {
+		if r := m.rows[i]; !r.check && r.step == step {
+			return r
+		}
+	}
+	return nil
+}
+
+func (m *Model) started(step string, at time.Time) {
+	m.state, m.output, m.log = "running", nil, pane{}
+	r := m.current(step)
+	if step == "agent" && r.state == "pending" {
+		r.label = "Agent · unit 1"
+	}
+	if step == "agent" || step == "ponytail" {
+		m.focus = nil
+		m.agent, m.history, m.open = nil, pane{}, nil
+	}
+	r.state, r.start = "running", at
+}
+
+// tools is how many tool calls the Agent box has.
+func (m *Model) tools() (n int) {
+	for _, a := range m.agent {
+		if a.tool != "" {
+			n++
+		}
+	}
+	return n
+}
+
+func (m *Model) ended(e event) {
+	r := m.current(e.Step)
+	if r == nil {
+		return
+	}
+	r.state, r.took = e.State, time.Duration(e.DurationMS)*time.Millisecond
+	r.hasDuration = e.State != "pending" || e.DurationMS > 0
+	switch e.Step {
+	case "issue":
+		m.title, m.number, r.note = e.Title, e.Number, e.Type
+	case "clone":
+		r.note, m.clone = e.SHA[:min(8, len(e.SHA))], e.Clone
+	case "agent":
+		var report *report
+		if json.Unmarshal(e.Report, &report) == nil && report != nil {
+			m.agent = append(m.agent, &activity{report: report})
+		}
+		r.note = fmt.Sprintf("%d tools", m.tools())
+		if e.ResumedFrom != "" { // its agent's work, picked up: no agent call
+			r.note = "resumed from " + e.ResumedFrom
+		}
+	case "ponytail":
+		var report struct {
+			Findings []struct{ File, Family, Finding string }
+		}
+		_ = json.Unmarshal(e.Report, &report)
+		r.note = map[bool]string{true: fmt.Sprintf("%d cuts", len(report.Findings)), false: "no cut"}[e.Kept]
+		for _, f := range e.Verdicts {
+			m.findings = append(m.findings, finding{"warning", f.Verdict + " · " + f.File, f.Finding})
+		}
+	case "delivery":
+		r.note = e.Branch
+	}
+	if e.State == "failed" {
+		why, _, _ := strings.Cut(e.Error, "\n")
+		m.findings = append(m.findings, finding{"error", m.failedAt(r), why})
+	}
+}
+
+// failedAt is the failed node r's label, and its failed command's, if one failed.
+func (m *Model) failedAt(r *row) string {
+	for _, c := range m.rows[slices.Index(m.rows, r)+1:] {
+		if !c.check {
+			break
+		}
+		if c.state == "failed" {
+			return r.label + " · " + c.label
+		}
+	}
+	return r.label
+}
+
+// command is the command row under the current row of node step, else that row; nil for none.
+func (m *Model) command(step, check string) *row {
+	r := m.current(step)
+	for _, c := range m.rows[slices.Index(m.rows, r)+1:] {
+		if !c.check {
+			break
+		}
+		if c.label == check {
+			return c
+		}
+	}
+	return r
+}
+
+// checkRow is the command row under the current row of node step, added when new.
+func (m *Model) checkRow(step, name string) *row {
+	i := slices.Index(m.rows, m.current(step))
+	for i++; i < len(m.rows) && m.rows[i].check; i++ {
+		if m.rows[i].label == name {
+			return m.rows[i]
+		}
+	}
+	r := &row{step: step, label: name, check: true}
+	m.rows = slices.Insert(m.rows, i, r)
+	return r
+}
+
+// tool notes a tool call, or its result, by its id; its empty fields leave the call's as they were.
+func (m *Model) tool(e event) {
+	i := slices.IndexFunc(m.agent, func(a *activity) bool { return e.ID != "" && a.id == e.ID })
+	if i < 0 {
+		m.agent = append(m.agent, &activity{id: e.ID})
+		i = len(m.agent) - 1
+	}
+	a := m.agent[i]
+	for to, v := range map[*string]string{&a.tool: e.Tool, &a.detail: e.Detail, &a.result: e.Result,
+		&a.summary: e.Summary} {
+		if v != "" {
+			*to = v
+		}
+	}
+}
+
+// end keeps how the run ended for the final view.
+func (m *Model) end(o run.Outcome, err error) {
+	m.decision(event{})
+	cold := !slices.ContainsFunc(m.rows, func(r *row) bool { return r.state != "pending" })
+	if cold {
+		m.restoreReport(o.Report, o)
+	}
+	m.done, m.outcome, m.err = true, o, err
+	m.state = map[bool]string{true: "failed", false: o.Outcome}[err != nil || o.Outcome != "passed"]
+	for _, r := range m.rows {
+		if r.state == "pending" && !strings.HasPrefix(r.step, "gate:") {
+			r.state = map[bool]string{true: "skipped", false: "not run"}[o.Outcome == "passed"]
+		}
+	}
+	if why := o.Reason; o.Outcome == "failed" && why != "" {
+		if !slices.ContainsFunc(m.findings, func(f finding) bool { return f.severity == "error" && f.text == why }) {
+			m.findings = append(m.findings, finding{"error", "atm run " + o.Issue, why})
+		}
+	}
+	if err != nil {
+		m.findings = append(m.findings, finding{"error", "atm", err.Error()})
+	}
+}

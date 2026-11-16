@@ -1,0 +1,492 @@
+package tui
+
+import (
+	"cmp"
+	"encoding/json"
+	"fmt"
+	"os"
+	"os/exec"
+	"path/filepath"
+	"regexp"
+	"slices"
+	"strconv"
+	"strings"
+	"time"
+
+	tea "github.com/charmbracelet/bubbletea"
+	"github.com/charmbracelet/lipgloss"
+)
+
+// gate is what no-mistakes, the gate after Delivery, shows of the run of the delivered branch: its steps, and
+// whether it ended; not ok when it shows no run.
+type gate struct {
+	steps              []gateStep
+	ok, over, afterEnd bool
+}
+
+// gateStep is a step of the gate: its state as the screen names it, its log and its findings.
+type gateStep struct {
+	name, state string
+	took        time.Duration
+	log         []*activity
+	findings    []map[string]string
+}
+
+// gateStates is each no-mistakes step status as the screen names it; any other is unknown.
+var gateStates = map[string]string{"pending": "pending", "running": "running", "awaiting_approval": "waiting",
+	"fixing": "running", "completed": "passed", "failed": "failed", "skipped": "skipped"}
+
+var gateNames = []string{"intent", "rebase", "review", "test", "document", "lint", "push", "pr", "ci"}
+
+// savedGate asks by the id kept in Delivery's output, from the surviving run directory.
+func savedGate(report string) gate {
+	dir := filepath.Dir(report)
+	b, _ := os.ReadFile(filepath.Join(dir, "delivery-output.txt"))
+	idLine := regexp.MustCompile(`(?m)^\s*id: "([^"]+)"\s*$`).FindSubmatch(b)
+	if len(idLine) > 1 {
+		if g := askGate(dir, "--run", string(idLine[1])); g.ok {
+			return g
+		}
+	}
+	g := gate{}
+	for _, name := range gateNames {
+		g.steps = append(g.steps, gateStep{name: name, state: "unknown"})
+	}
+	return g
+}
+
+// askGate asks no-mistakes in dir for its branch's run, or the explicit runArgs, and each started step's log.
+// ponytail: every started step's log on every ask, one no-mistakes call each; ask only the changed ones if it lags.
+func askGate(dir string, runArgs ...string) gate {
+	run, tables, err := axi(dir, append([]string{"status"}, runArgs...)...)
+	if err != nil || run["run.status"] == "" {
+		return gate{}
+	}
+	g := gate{ok: true, over: slices.Contains([]string{"completed", "failed", "cancelled"}, run["run.status"])}
+	active := map[string]string{} // how long each running step has run: its duration_ms is 0 until it ends
+	for _, a := range tables["run.active_steps"] {
+		active[a["step"]] = a["active_for"]
+	}
+	for _, s := range tables["run.steps"] {
+		step := gateStep{name: s["step"], state: cmp.Or(gateStates[s["status"]], "unknown")}
+		step.took, _ = time.ParseDuration(s["duration_ms"] + "ms")
+		if took, err := time.ParseDuration(active[step.name]); err == nil && step.state == "running" {
+			step.took = took
+		}
+		if step.state != "pending" && step.state != "skipped" {
+			_, tables, _ := axi(dir, append([]string{"logs", "--step", step.name, "--full"}, runArgs...)...)
+			step.log = gateActivities(tables["log"])
+			step.findings = tables["findings"]
+		}
+		if step.name == run["gate.step"] {
+			for _, f := range tables["gate.findings"] {
+				if !slices.ContainsFunc(step.findings, func(shown map[string]string) bool { return shown["id"] == f["id"] }) {
+					step.findings = append(step.findings, f)
+				}
+			}
+		}
+		g.steps = append(g.steps, step)
+	}
+	return g
+}
+
+// axi is no-mistakes axi args in dir, read as TOON.
+func axi(dir string, args ...string) (map[string]string, map[string][]map[string]string, error) {
+	cmd := exec.Command("no-mistakes", append([]string{"axi"}, args...)...)
+	cmd.Dir = dir
+	out, err := cmd.Output()
+	values, tables := toon(string(out))
+	return values, tables, err
+}
+
+// toon reads a TOON document: each value by its dotted path, and each table's rows by column.
+func toon(doc string) (map[string]string, map[string][]map[string]string) {
+	values, tables := map[string]string{}, map[string][]map[string]string{}
+	var path, cols []string
+	table := ""
+	for _, l := range strings.Split(doc, "\n") {
+		s := strings.TrimLeft(l, " ")
+		depth := (len(l) - len(s)) / 2
+		if s == "" {
+			continue
+		}
+		if cols != nil && depth > len(path) {
+			row := map[string]string{}
+			for i, v := range fields(s) {
+				if i < len(cols) {
+					row[cols[i]] = v
+				}
+			}
+			tables[table] = append(tables[table], row)
+			continue
+		}
+		cols, path = nil, path[:min(depth, len(path))]
+		key, value, _ := strings.Cut(s, ":")
+		if name, shape, ok := strings.Cut(key, "["); ok && strings.HasSuffix(shape, "}") {
+			_, header, _ := strings.Cut(strings.TrimSuffix(shape, "}"), "{")
+			cols, table = strings.Split(header, ","), strings.Join(append(path, name), ".")
+			continue
+		}
+		if value = strings.TrimSpace(value); value == "" {
+			path = append(path, key)
+			continue
+		}
+		values[strings.Join(append(path, key), ".")] = unquote(value)
+	}
+	return values, tables
+}
+
+// fields is a TOON table row's values: split at commas outside quotes, each unquoted.
+func fields(row string) (out []string) {
+	quoted, start := false, 0
+	for i := 0; i < len(row); i++ {
+		switch {
+		case quoted && row[i] == '\\':
+			i++
+		case row[i] == '"':
+			quoted = !quoted
+		case !quoted && row[i] == ',':
+			out, start = append(out, unquote(row[start:i])), i+1
+		}
+	}
+	return append(out, unquote(row[start:]))
+}
+
+func unquote(v string) string {
+	if u, err := strconv.Unquote(v); err == nil {
+		return u
+	}
+	return v
+}
+
+// gate puts the gate's steps in the ATM box, below ATM's, and keeps what they emit for the right column.
+func (m *Model) gate(g gate) {
+	m.gateLive = g.ok && !g.over
+	m.aborting = m.aborting && m.gateLive
+	if m.gateSteps == nil {
+		m.rows = slices.DeleteFunc(m.rows, func(r *row) bool { return strings.HasPrefix(r.step, "gate:") })
+	}
+	for _, s := range g.steps {
+		for _, old := range m.gateSteps {
+			if old.name == s.name {
+				for i := range min(len(old.log), len(s.log)) {
+					*old.log[i] = *s.log[i]
+					s.log[i] = old.log[i] // Keep report folds across polls.
+				}
+			}
+		}
+		r := m.current("gate:" + s.name)
+		if r == nil {
+			r = &row{step: "gate:" + s.name, label: s.name}
+			m.rows = append(m.rows, r)
+		}
+		if s.state != "running" {
+			r.start = time.Time{}
+		} else if r.state != "running" {
+			r.start = time.Now().Add(-s.took) // A running step counts on with the screen's clock, as ATM's steps do.
+		}
+		r.state, r.took, r.hasDuration = s.state, s.took, s.took > 0 || s.state == "passed" || s.state == "failed"
+	}
+	m.gateSteps = g.steps
+}
+
+var (
+	gateProcessLine         = regexp.MustCompile(`^\S+ (started|exited) pid=\d+( status=\S+)?$`)
+	gateMarkdownPunctuation = regexp.MustCompile(`[[:punct:]]`)
+)
+
+// gateActivities reads agent prose and final objects without changing the gate's log on disk. The empty lines
+// no-mistakes writes between entries are left out, as the process lines are: the screen draws each line as a row.
+func gateActivities(log []map[string]string) (out []*activity) {
+	var lines []string
+	for _, l := range log {
+		if s := strings.TrimSpace(l["line"]); s != "" && !gateProcessLine.MatchString(s) {
+			lines = append(lines, l["line"])
+		}
+	}
+	prose := ""
+	flush := func() {
+		if prose != "" {
+			out = append(out, &activity{says: strings.TrimSuffix(prose, "\n")})
+			prose = ""
+		}
+	}
+	for i := 0; i < len(lines); i++ {
+		if strings.HasPrefix(strings.TrimSpace(lines[i]), "{") {
+			text := strings.Join(lines[i:], "\n")
+			decoder := json.NewDecoder(strings.NewReader(text))
+			var r gateReport
+			if decoder.Decode(&r) == nil && (r.Summary != "" || r.Findings != nil || r.RiskLevel != "" ||
+				r.ReviewedPaths != nil || r.TestingSummary != "") {
+				flush()
+				out = append(out, &activity{report: r.readable()})
+				i += strings.Count(text[:decoder.InputOffset()], "\n")
+				continue
+			}
+		}
+		prose += lines[i] + "\n"
+	}
+	flush()
+	return out
+}
+
+type gateReport struct {
+	Summary  string
+	Findings []struct {
+		Severity, File, Description string
+		Line                        int
+	}
+	RiskLevel      string   `json:"risk_level"`
+	RiskRationale  string   `json:"risk_rationale"`
+	ReviewedPaths  []string `json:"reviewed_paths"`
+	TestingSummary string   `json:"testing_summary"`
+}
+
+func (r gateReport) readable() *report {
+	parts := []string{r.Summary}
+	for _, f := range r.Findings {
+		file := f.File
+		if f.Line > 0 {
+			file += fmt.Sprintf(":%d", f.Line)
+		}
+		parts = append(parts, f.Severity+" "+gateMarkdownPunctuation.ReplaceAllString(file, `\$0`)+" "+f.Description)
+	}
+	if r.RiskLevel != "" {
+		parts = append(parts, "Riesgo: "+r.RiskLevel)
+	}
+	parts = append(parts, r.RiskRationale, r.TestingSummary)
+	parts = slices.DeleteFunc(parts, func(s string) bool { return s == "" })
+	return &report{Summary: strings.Join(parts, "\n\n"), ChangedFiles: r.ReviewedPaths}
+}
+
+// ask asks no-mistakes for the gate after wait, noting whether the run had ended when it asked.
+func (m *Model) ask(wait time.Duration) tea.Cmd {
+	clone, afterEnd := m.clone, m.done
+	return tea.Tick(wait, func(time.Time) tea.Msg {
+		g := askGate(clone)
+		g.afterEnd = afterEnd
+		return g
+	})
+}
+
+// gateKey answers the gate from the footer, through no-mistakes' own commands in the clone: a and s approve
+// and skip the waiting step; f selects a fix line; x, then y, aborts the gate. Enter takes a line for the
+// reviewer's question while one shows, else a fix's instructions. ok when the key was the gate's.
+func (m *Model) gateKey(k tea.KeyMsg) (cmd tea.Cmd, ok bool) {
+	switch {
+	case m.typing:
+		switch k.Type {
+		case tea.KeyEnter, tea.KeyEsc, tea.KeyBackspace, tea.KeyRunes, tea.KeySpace:
+			return m.typed(k), true
+		}
+		return nil, false
+	case m.aborting:
+		m.aborting = false
+		if k.String() == "y" && m.gateLive {
+			return m.respond("abort"), true
+		}
+		return nil, false
+	}
+	m.fixSelected = false
+	waiting := m.waiting() != nil
+	switch s := k.String(); {
+	case s == "x" && m.gateLive:
+		m.aborting = true
+	case s == "enter" && (waiting || m.question() != ""):
+		m.typing, m.text = true, ""
+	case waiting && slices.Contains([]string{"a", "s"}, s):
+		return m.respond("respond", "--action", map[string]string{"a": "approve", "s": "skip"}[s]), true
+	case waiting && s == "f":
+		m.fixSelected = true
+	default:
+		return nil, false
+	}
+	return nil, true
+}
+
+// typed takes k into the line: enter sends it, esc drops it, backspace deletes its last character.
+func (m *Model) typed(k tea.KeyMsg) tea.Cmd {
+	switch k.Type {
+	case tea.KeyEnter:
+		m.typing = false
+		return m.send(m.text)
+	case tea.KeyEsc:
+		m.typing = false
+	case tea.KeyBackspace:
+		m.text = string([]rune(m.text)[:max(0, len([]rune(m.text))-1)])
+	case tea.KeyRunes, tea.KeySpace:
+		m.text += string(k.Runes)
+	}
+	return nil
+}
+
+// gateKeys is the footer's keys for the gate while it shows.
+func (m *Model) gateKeys() string {
+	if !m.gateLive {
+		return ""
+	}
+	key := func(k, what string) string {
+		return "  " + lipgloss.NewStyle().Bold(true).Render(k) + " " + paint(dim, what)
+	}
+	switch {
+	case m.aborting:
+		return key("y", "abort the gate")
+	case m.fixSelected:
+		return key("enter", "fix with a line")
+	case m.question() != "":
+		return key("enter", "answer") + key("x", "abort")
+	case m.waiting() != nil:
+		return key("a", "approve") + key("f", "fix") + key("s", "skip") + key("x", "abort") +
+			key("enter", "fix with a line")
+	default:
+		return key("x", "abort")
+	}
+}
+
+// waiting is the gate's step waiting for an answer, nil for none.
+func (m *Model) waiting() *gateStep {
+	for i := range m.gateSteps {
+		if m.gateSteps[i].state == "waiting" {
+			return &m.gateSteps[i]
+		}
+	}
+	return nil
+}
+
+// question is the first question-<id> finding not answered during this attachment; empty for none.
+func (m *Model) question() string {
+	for _, s := range m.gateSteps {
+		for _, f := range s.findings {
+			if strings.HasPrefix(f["id"], "question-") && !slices.Contains(m.answered, f["id"]) {
+				return f["id"]
+			}
+		}
+	}
+	return ""
+}
+
+type gateAnswer string
+
+// send answers the reviewer's question with line while one shows, and else fixes with line.
+func (m *Model) send(line string) tea.Cmd {
+	if q := m.question(); q != "" {
+		clone := m.clone
+		return func() tea.Msg {
+			if _, _, err := axi(clone, "answer", "--question", q, "--answer", line); err == nil {
+				return gateAnswer(q)
+			}
+			return nil
+		}
+	}
+	return m.fix(line)
+}
+
+// fix fixes the waiting step's findings with line as instructions: those named by ids before a colon
+// ("<id>,<id>: <text>"), ignoring the others shown, or else every one shown.
+func (m *Model) fix(line string) tea.Cmd {
+	var shown []string
+	if w := m.waiting(); w != nil {
+		for _, f := range w.findings {
+			shown = append(shown, f["id"])
+		}
+	}
+	fix, ignore := shown, []string(nil)
+	if head, text, ok := strings.Cut(line, ":"); ok {
+		named := strings.Split(head, ",")
+		for i := range named {
+			named[i] = strings.TrimSpace(named[i])
+		}
+		if !slices.ContainsFunc(named, func(id string) bool { return !slices.Contains(shown, id) }) {
+			fix, line = named, strings.TrimSpace(text)
+			ignore = slices.DeleteFunc(slices.Clone(shown), func(id string) bool { return slices.Contains(named, id) })
+		}
+	}
+	args := []string{"respond", "--action", "fix", "--findings", strings.Join(fix, ",")}
+	if len(ignore) > 0 {
+		args = append(args, "--ignore", strings.Join(ignore, ","))
+	}
+	if line != "" {
+		args = append(args, "--instructions", line)
+	}
+	return m.respond(args...)
+}
+
+// respond runs no-mistakes axi args in the clone, aside, as respond blocks until the gate's next stop; the screen
+// sees what it did on its next ask.
+// ponytail: a refused answer shows nowhere but in the gate staying parked; paint its error if that confuses.
+func (m *Model) respond(args ...string) tea.Cmd {
+	clone := m.clone
+	return func() tea.Msg {
+		_, _, _ = axi(clone, args...)
+		return nil
+	}
+}
+
+// gateBox is what the gate's started steps emit, in lines rows: a header row for each, a click folding it as
+// thinking folds, then its prose and reports as the Agent box renders them, its first line only while folded,
+// then its findings, one line each.
+func (m *Model) gateBox(width, lines int) string {
+	var out []paneLine
+	for _, s := range m.gateSteps {
+		if s.state == "pending" || s.state == "skipped" {
+			continue
+		}
+		key := "gate:" + s.name
+		open := m.unfolded(key)
+		out = append(out, paneLine{key: key, toggle: key, text: fold(open) + " " + m.icon(s.state) + " " + s.name})
+		out = m.gateLogLines(out, s, width, open)
+		for _, f := range s.findings {
+			out = append(out, paneLine{key: key + ":finding:" + f["id"], parent: key,
+				text: "  " + f["id"] + " " + paint(yellow, f["severity"]) + " " +
+					f["file"] + " " + paint(dim, oneLine(f["description"]))})
+		}
+	}
+	shown := m.history.show(out, lines)
+	result := box(bold(cyan, "Gate"), strings.Join(shown, "\n"), width, m.border(&m.history))
+	m.historyHeight = lipgloss.Height(result)
+	return result
+}
+
+func (m *Model) gateLogLines(out []paneLine, s gateStep, width int, open bool) []paneLine {
+	log := s.log
+	if !open && len(log) > 0 {
+		log = log[:1]
+	}
+	for _, a := range log {
+		if a.report != nil {
+			lines := m.gateReportLines(nil, a, width)
+			if !open {
+				lines = lines[:1]
+			}
+			out = append(out, lines...)
+			continue
+		}
+		text, prefix := a.says, "  "
+		if !open {
+			text, _, _ = strings.Cut(text, "\n")
+		}
+		if s.name == "review" || s.name == "fix" {
+			prefix = "✎ "
+		}
+		texts, _, _ := agentTextRows(prefix, text, width, codeFence{})
+		for _, text := range texts {
+			out = append(out, paneLine{key: fmt.Sprintf("activity:%p", a), parent: "gate:" + s.name, text: text})
+		}
+	}
+	return out
+}
+
+// Reuse Informe and its summary and file folds; the gate reports reviewed files, not worker commands or tests.
+func (m *Model) gateReportLines(out []paneLine, a *activity, width int) []paneLine {
+	key := fmt.Sprintf("report:%p", a)
+	for _, line := range m.reportLines(nil, a, width) {
+		if line.key == key || line.key == key+":summary" ||
+			(len(a.report.ChangedFiles) > 0 && (line.key == key+":0" || line.parent == key+":0")) {
+			if line.key == key+":0" {
+				line.text = strings.Replace(line.text, "Ficheros cambiados", "Ficheros revisados", 1)
+			}
+			out = append(out, line)
+		}
+	}
+	return out
+}

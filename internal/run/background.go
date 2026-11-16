@@ -1,0 +1,812 @@
+package run
+
+import (
+	"bufio"
+	"cmp"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"io"
+	"net"
+	"os"
+	"os/exec"
+	"path/filepath"
+	"slices"
+	"strconv"
+	"strings"
+	"sync"
+	"time"
+
+	"github.com/thellmwhisperer/runscreen/internal/buildinfo"
+)
+
+// The background process of a repository runs its runs, each in itself, so closing the terminal that started
+// one leaves it going. The first atm command that needs it starts it, as atm serve, and it listens on
+// .atm/atm.sock until it has had no run for idle. Requests and replies are JSON lines; exchange handles reply
+// completion. How each run ended goes to .atm/runs.jsonl.
+
+// Outcome is a run of the background process: running, or how it ended.
+type Outcome struct {
+	Outcome    string         `json:"outcome"` // running, waiting, passed or failed
+	Run        string         `json:"run"`     // its label: the issue's name and the run's number in the repository
+	BaseSHA    string         `json:"base_sha,omitempty"`
+	FailedNode string         `json:"failed_node"`
+	Reason     string         `json:"reason"`
+	Report     string         `json:"report"` // report.json, none when the run failed before its first node
+	NextStep   string         `json:"next_step"`
+	Issue      string         `json:"issue"`
+	Step       string         `json:"step"` // the last node it started
+	Agent      *AgentSettings `json:"agent,omitempty"`
+	Started    time.Time      `json:"started"`
+	Ended      time.Time      `json:"ended"`
+	Serve      string         `json:"serve,omitempty"` // buildinfo.String() of the serve that executed it
+}
+
+// AgentSettings is the effective requested selection, kept independently of observed models.
+// A nil selection on an old run means it predates attribution.
+type AgentSettings struct {
+	Harness     string   `json:"harness"`
+	Model       string   `json:"model"`
+	Effort      string   `json:"effort"`
+	HarnessArgs []string `json:"harness_args"`
+}
+
+// AgentLabel is the requested harness and model for run listings; default is display only.
+func (o Outcome) AgentLabel() string {
+	if o.Agent == nil {
+		return "-"
+	}
+	return o.Agent.Harness + " " + cmp.Or(o.Agent.Model, "default")
+}
+
+// Waits says whether the run waits for its launcher's answer to a decision: it goes on once answered.
+func (o Outcome) Waits() bool { return strings.HasPrefix(o.NextStep, "atm answer ") }
+
+// ServeLabel is that version, or - when the run was recorded before it.
+func (o Outcome) ServeLabel() string { return cmp.Or(o.Serve, "-") }
+
+// Duration is how long the run took, or has taken so far, as ATM prints every time.
+func (o Outcome) Duration() string {
+	return Human(cmp.Or(o.Ended, time.Now()).Sub(o.Started))
+}
+
+// Err is the ended run as atm's error: nil when it passed, else its reason under the failed node's exit code.
+func (o Outcome) Err() error {
+	if o.Outcome == "passed" {
+		return nil
+	}
+	return exitError{cmp.Or(codes[o.FailedNode], 2), errors.New(o.Reason)}
+}
+
+type request struct {
+	BaseSHA string   `json:"base_sha,omitempty"`
+	Answer  string   `json:"answer,omitempty"`
+	By      string   `json:"by,omitempty"`
+	Cmd     string   `json:"cmd"` // run, attach or runs
+	Args    []string `json:"args,omitempty"`
+	Run     string   `json:"run,omitempty"`
+	From    int      `json:"from,omitempty"` // attach: the first frame to send, after those a screen already has
+}
+
+// Frame is a piece of a run's screen.
+type Frame struct {
+	Line  *string         `json:"line,omitempty"`  // a line of its plain screen
+	Event json.RawMessage `json:"event,omitempty"` // a node's start or end, or a live event inside it
+}
+
+type reply struct {
+	Frame
+	Run   *Outcome  `json:"run,omitempty"`
+	Runs  []Outcome `json:"runs,omitempty"`
+	Error string    `json:"error,omitempty"`
+}
+
+// maxRuns is the target history size; running runs are exempt. ponytail: fixed; a key in .atm.yaml is the upgrade.
+var maxRuns = 200
+
+// idle is how long the background process waits without a run before it ends; tick is how often it checks.
+var idle, tick = 10 * time.Minute, 5 * time.Second
+
+// socket is the background process's socket for the repository at root.
+func socket(root string) string { return filepath.Join(root, ".atm", "atm.sock") }
+
+// short is path relative to the working directory when that is shorter: a socket's path has to fit in about
+// a hundred bytes.
+func short(path string) string {
+	wd, err := os.Getwd()
+	if err == nil {
+		wd, err = filepath.EvalSymlinks(wd)
+	}
+	if rel, e := filepath.Rel(wd, path); err == nil && e == nil && len(rel) < len(path) {
+		return rel
+	}
+	return path
+}
+
+// Serve is the background process of the repository at root, its working directory. It ends when it has had
+// no run for idle, when its socket is removed or its file changed while no run goes, or at once when another one
+// serves root. Only
+// the one that holds .atm/atm.lock serves: another waits for it to answer, then ends, so the atm command that
+// started it connects to that one.
+func Serve(root string) error {
+	moved := changed()
+	sock := socket(root)
+	for start := time.Now(); ; time.Sleep(20 * time.Millisecond) {
+		f, err := lock(filepath.Join(root, ".atm", "atm.lock")) // connect, which starts it, made .atm
+		if err != nil {
+			return err
+		}
+		if f != nil {
+			defer func() { _ = f.Close() }()
+			break
+		}
+		if c, err := net.Dial("unix", short(sock)); err == nil {
+			_ = c.Close()
+			return errors.New("a background process already serves " + root)
+		}
+		if time.Since(start) > idle {
+			return errors.New("the background process that holds .atm/atm.lock does not answer")
+		}
+	}
+	_ = os.Remove(sock) // a dead one's
+	l, err := net.Listen("unix", short(sock))
+	if err != nil {
+		return err
+	}
+	defer func() { _ = l.Close() }()
+	if err := os.Chmod(sock, 0o600); err != nil { // whoever reaches it runs agents as this user
+		return err
+	}
+	fmt.Fprintln(os.Stderr, "atm serve pid:", os.Getpid())
+	fmt.Fprintln(os.Stderr, "atm serve version:", buildinfo.String())
+	return serve(l.(*net.UnixListener), root, sock, moved)
+}
+
+// server is the background process's state, under its lock.
+type server struct {
+	sync.Mutex
+	root     string
+	runs     []*bgRun
+	last     time.Time // when it last had a run going
+	handlers int
+	handoff  bool
+}
+
+// bgRun is a run of the background process: its outcome, its screen so far, and more, closed and replaced
+// at each frame of its screen and closed for good at its end.
+type bgRun struct {
+	Outcome
+	frames []Frame
+	more   chan struct{}
+	answer chan decisionAnswer
+}
+
+// add puts f on r's screen. Under the server's lock.
+func (r *bgRun) add(f Frame) {
+	r.frames = append(r.frames, f)
+	close(r.more)
+	r.more = make(chan struct{})
+}
+
+func serve(l *net.UnixListener, root, sock string, moved func() bool) error {
+	runs, err := history(root)
+	if err != nil {
+		return err
+	}
+	s := &server{root: root, runs: runs, last: time.Now()}
+	// Accept has no deadline: on Windows one that expires cancels the pending accept, which can lose the connection
+	// arriving then, still open on its client's side, whose read waits forever.
+	conns, failed := make(chan net.Conn), make(chan error, 1)
+	go func() {
+		for {
+			c, err := l.Accept()
+			if err != nil {
+				failed <- err
+				return
+			}
+			conns <- c
+		}
+	}()
+	for {
+		var c net.Conn
+		select {
+		case c = <-conns:
+		case err := <-failed:
+			return err
+		case <-time.After(tick):
+		}
+		if s.shouldExit(c, sock, moved) {
+			_ = l.Close()
+			for { // close each unanswered request after the socket, so its client starts the next one
+				if c != nil {
+					_ = c.Close()
+				}
+				select {
+				case c = <-conns:
+				case <-failed:
+					return nil
+				}
+			}
+		}
+		if c != nil {
+			go s.handleConnection(c)
+		}
+	}
+}
+
+func (s *server) shouldExit(c net.Conn, sock string, moved func() bool) bool {
+	_, gone := os.Stat(sock)
+	s.Lock()
+	defer s.Unlock()
+	if moved() || c == nil && s.busy() == 0 && (gone != nil || time.Since(s.last) > idle) {
+		s.handoff = true
+	}
+	if c == nil && s.busy() > 0 {
+		s.save() // runs.jsonl's time is when its runs last ran, should this process die before they end
+	}
+	if c == nil {
+		return s.handoff && s.busy() == 0 && s.handlers == 0
+	}
+	if s.handoff && s.busy() == 0 && s.handlers == 0 {
+		return true
+	}
+	s.handlers++
+	return false
+}
+
+func (s *server) handleConnection(c net.Conn) {
+	defer func() {
+		_ = c.Close()
+		s.Lock()
+		s.handlers--
+		s.Unlock()
+	}()
+	s.handle(c)
+}
+
+// changed tells whether the file this process runs from has changed since it started, as atm update or
+// install.sh replace it: one of the old file ends once it has no run, so atm run gets one of the new.
+func changed() func() bool {
+	exe, err := os.Executable()
+	if err != nil {
+		return func() bool { return false }
+	}
+	was, err := os.Stat(exe)
+	return func() bool {
+		now, e := os.Stat(exe)
+		return err == nil && (e != nil || !os.SameFile(was, now) || now.Size() != was.Size() ||
+			!now.ModTime().Equal(was.ModTime()))
+	}
+}
+
+// busy is how many runs go.
+func (s *server) busy() (n int) {
+	for _, r := range s.runs {
+		if r.Ended.IsZero() || r.answer != nil {
+			n++
+		}
+	}
+	return n
+}
+
+func (s *server) handle(c net.Conn) {
+	var req request
+	dec := json.NewDecoder(c)
+	if err := dec.Decode(&req); err != nil {
+		return
+	}
+	enc := json.NewEncoder(c)
+	switch req.Cmd {
+	case "run":
+		o, err := s.start(req.Args, req.BaseSHA)
+		if err != nil {
+			if errors.Is(err, errHandoff) {
+				return
+			}
+			_ = enc.Encode(reply{Error: err.Error()})
+			return
+		}
+		_ = enc.Encode(reply{Run: &o})
+	case "answer":
+		if err := s.answerRun(req.Run, req.Answer, req.By); err != nil {
+			_ = enc.Encode(reply{Error: err.Error()})
+		} else {
+			_ = enc.Encode(reply{})
+		}
+	case "runs":
+		s.Lock()
+		runs := make([]Outcome, len(s.runs))
+		for i, r := range s.runs {
+			runs[i] = r.Outcome
+		}
+		s.Unlock()
+		_ = enc.Encode(reply{Runs: runs})
+	case "attach":
+		s.attach(req, enc)
+	default:
+		_ = enc.Encode(reply{Error: "unknown request " + strconv.Quote(req.Cmd)})
+	}
+}
+
+var errHandoff = errors.New("background process is handing off")
+
+// start runs args, atm run's command line, in the background and returns the run, just started.
+func (s *server) start(args []string, baseSHA string) (Outcome, error) {
+	issue := ""
+	if len(args) > 0 {
+		issue = args[len(args)-1]
+	}
+	name := nonSlug.ReplaceAllString(strings.ToLower(strings.TrimSuffix(filepath.Base(issue),
+		filepath.Ext(issue))), "-")
+	s.Lock()
+	defer s.Unlock()
+	if s.handoff {
+		return Outcome{}, errHandoff
+	}
+	n := 0
+	max := func(label string) {
+		if number, err := strconv.Atoi(label[strings.LastIndex(label, "-")+1:]); err == nil && number > n {
+			n = number
+		}
+	}
+	for _, r := range s.runs {
+		if r.Issue == issue && r.answer != nil {
+			if _, _, resume, _, err := parseArgs(args); err == nil && *resume == "" {
+				return Outcome{}, fmt.Errorf("issue %s has run %s waiting for an answer; "+
+					"use atm answer %s approve|fix|stop --by <who>", issue, r.Run, r.Run)
+			}
+		}
+		max(r.Run)
+	}
+	runsDir := filepath.Join(s.root, ".atm", "runs")
+	entries, err := os.ReadDir(runsDir)
+	if err != nil && !errors.Is(err, os.ErrNotExist) {
+		return Outcome{}, err
+	}
+	for _, entry := range entries {
+		max(entry.Name())
+	}
+	r := &bgRun{more: make(chan struct{}),
+		Outcome: Outcome{Outcome: "running", Issue: issue, BaseSHA: baseSHA, Started: time.Now(),
+			Serve: buildinfo.String(), Run: cmp.Or(strings.Trim(name, "-"), "run") + "-" + strconv.Itoa(n+1)}}
+	r.Report = filepath.Join(runDir(s.root, r.Run), "report.json")
+	if err := os.MkdirAll(filepath.Dir(r.Report), 0o755); err != nil {
+		return Outcome{}, err
+	}
+	s.runs = append(s.runs, r)
+	s.save()
+	go s.run(r, args, baseSHA)
+	return r.Outcome, nil
+}
+
+func (s *server) run(r *bgRun, args []string, baseSHA string) {
+	err := func() (err error) {
+		defer func() {
+			if p := recover(); p != nil { // one run's crash ends that run, not every run
+				err = fmt.Errorf("atm crashed: %v", p)
+			}
+		}()
+		return runAt(r.Run, baseSHA, args, &screen{s: s, r: r, events: true}, &screen{s: s, r: r})
+	}()
+	_, cannot := resumeFrom(s.root, r.Run)
+	s.Lock()
+	defer s.Unlock()
+	o := &r.Outcome
+	o.Outcome, o.Ended, s.last = outcome(err), time.Now(), time.Now()
+	if err != nil {
+		o.Reason, _, _ = strings.Cut(err.Error(), "\n")
+	}
+	if o.Step == "" { // no first node, so report.json was never written
+		o.Report = ""
+	}
+	again := ", then run it again: atm run " + o.Issue
+	switch {
+	case o.Outcome == "passed" && o.Step == "delivery":
+		o.NextStep = "review the branch the delivery command got"
+	case o.Outcome == "passed":
+		o.NextStep = "nothing kept the work: set delivery in .atm.yaml to hand it on"
+	case o.FailedNode == "":
+		o.NextStep = "fix the reason" + again
+	case cannot == nil:
+		o.NextStep = "read why " + o.FailedNode + " failed in the report, fix it, then pick up its agent's work: " +
+			"atm run --resume " + o.Run
+	default:
+		o.NextStep = "read why " + o.FailedNode + " failed in the report, fix it" + again
+	}
+	s.save()
+	close(r.more)
+}
+
+// attach sends the screen of run req.Run, the last one that runs when it is "", or else the last one, as it
+// grows, and then how it ended.
+func (s *server) attach(req request, enc *json.Encoder) {
+	label := req.Run
+	r := s.find(label)
+	if r == nil {
+		msg := "no run yet"
+		if label != "" {
+			msg = "no run " + label
+		}
+		_ = enc.Encode(reply{Error: msg})
+		return
+	}
+	s.Lock()
+	i := min(max(req.From, 0), len(r.frames))
+	s.Unlock()
+	for {
+		s.Lock()
+		frames, more, o := r.frames[i:], r.more, r.Outcome
+		s.Unlock()
+		for _, f := range frames {
+			if enc.Encode(reply{Frame: f}) != nil {
+				return // the client left; the run goes on
+			}
+		}
+		i += len(frames)
+		if !o.Ended.IsZero() || o.Outcome == "waiting" {
+			_ = enc.Encode(reply{Run: &o})
+			return
+		}
+		<-more
+	}
+}
+
+// find is run label, the last one that runs when label is "", or else the last one; nil when there is none.
+func (s *server) find(label string) *bgRun {
+	s.Lock()
+	defer s.Unlock()
+	for i := len(s.runs) - 1; i >= 0; i-- {
+		if s.runs[i].Run == label || label == "" && s.runs[i].Ended.IsZero() {
+			return s.runs[i]
+		}
+	}
+	if label == "" && len(s.runs) > 0 {
+		return s.runs[len(s.runs)-1]
+	}
+	return nil
+}
+
+// screen is a run's screen: what Run writes, a line at a time, its node events, when events, as a line each
+// with the event behind it, and the live events Run has it watch.
+type screen struct {
+	s      *server
+	r      *bgRun
+	events bool
+	lines  lineWriter
+}
+
+func (w *screen) Write(p []byte) (int, error) {
+	if w.lines.fn == nil {
+		w.lines.fn = w.line
+	}
+	return w.lines.Write(p)
+}
+
+func (w *screen) line(line string) {
+	w.s.Lock()
+	defer w.s.Unlock()
+	f := Frame{Line: &line}
+	if w.events {
+		plain := w.r.event(line)
+		f = Frame{Line: &plain, Event: json.RawMessage(line)}
+		w.s.save() // its node, should this process die before the run ends
+	}
+	w.r.add(f)
+}
+
+func (w *screen) watch(ev []byte) {
+	w.s.Lock()
+	defer w.s.Unlock()
+	w.r.add(Frame{Event: ev})
+}
+
+// event is the screen line of node event line, which it notes in the run's outcome.
+func (r *bgRun) event(line string) string {
+	var ev struct {
+		Step, State, Error string
+		Message            string
+		Agent              *AgentSettings
+		DurationMS         *int64 `json:"duration_ms"`
+		ResumedFrom        string `json:"resumed_from"`
+	}
+	if json.Unmarshal([]byte(line), &ev) != nil {
+		return line
+	}
+	if ev.Step == "decision" {
+		return r.decision(line)
+	}
+	if ev.Message != "" {
+		return ev.Message
+	}
+	r.Step = ev.Step
+	if ev.Agent != nil {
+		r.Agent = ev.Agent
+	}
+	switch ev.State {
+	case "failed":
+		r.FailedNode = ev.Step
+	case "started":
+		r.FailedNode = ""
+	}
+	line = fmt.Sprintf("%-9s %s", ev.Step, ev.State)
+	if ev.DurationMS != nil {
+		line += " " + Human(time.Duration(*ev.DurationMS)*time.Millisecond)
+	}
+	if ev.ResumedFrom != "" {
+		line += ", resumed from " + ev.ResumedFrom
+	}
+	if why, _, _ := strings.Cut(ev.Error, "\n"); why != "" {
+		line += ": " + why
+	}
+	return line
+}
+
+// history is the runs in root's .atm/runs.jsonl, how each last stood. One still running there ran in a
+// background process that ended before it did.
+func history(root string) ([]*bgRun, error) {
+	all, modified, err := recordedRuns(root)
+	var runs []*bgRun
+	for _, o := range all {
+		if o.Waits() {
+			o.Outcome, o.Ended = "failed", modified
+			o.Reason = "the background process ended while the run waited for an answer"
+			_, recovery, _ := strings.Cut(o.NextStep, "; recovery: ")
+			o.NextStep = cmp.Or(recovery, "run it again: atm run "+o.Issue)
+		} else if o.Ended.IsZero() {
+			o.Outcome, o.FailedNode, o.Ended = "failed", o.Step, modified
+			o.Reason = "the background process ended before the run did"
+			o.NextStep = "run it again: atm run " + o.Issue
+		}
+		runs = append(runs, &bgRun{Outcome: o})
+	}
+	return runs, err
+}
+
+// RecordedRuns reads the last line of each run in runs.jsonl without changing its recorded outcome.
+func RecordedRuns(root string) ([]Outcome, error) {
+	runs, _, err := recordedRuns(root)
+	return runs, err
+}
+
+func recordedRuns(root string) ([]Outcome, time.Time, error) {
+	f, err := os.Open(filepath.Join(root, ".atm", "runs.jsonl"))
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return nil, time.Time{}, nil // no run yet
+		}
+		return nil, time.Time{}, err
+	}
+	defer func() { _ = f.Close() }()
+	info, err := f.Stat()
+	if err != nil {
+		return nil, time.Time{}, err
+	}
+	var runs []Outcome
+	at := map[string]int{}
+	sc := bufio.NewScanner(f)
+	sc.Buffer(make([]byte, 64*1024), 1024*1024)
+	for sc.Scan() {
+		var o Outcome
+		if json.Unmarshal(sc.Bytes(), &o) != nil {
+			continue
+		}
+		if i, ok := at[o.Run]; ok {
+			runs[i] = o
+			continue
+		}
+		at[o.Run] = len(runs)
+		runs = append(runs, o)
+	}
+	return runs, info.ModTime(), sc.Err()
+}
+
+// save drops the oldest runs that ended past maxRuns, then writes the runs to runs.jsonl, through a file renamed
+// over it, so a crash leaves the last one whole. Under the server's lock.
+func (s *server) save() {
+	for i := 0; len(s.runs) > maxRuns && i < len(s.runs); {
+		if s.runs[i].Ended.IsZero() || s.runs[i].answer != nil {
+			i++
+		} else {
+			s.runs = slices.Delete(s.runs, i, i+1)
+		}
+	}
+	var b []byte
+	for _, r := range s.runs {
+		line, _ := json.Marshal(r.Outcome)
+		b = append(append(b, line...), '\n')
+	}
+	path := filepath.Join(s.root, ".atm", "runs.jsonl")
+	err := os.WriteFile(path+".tmp", b, 0o644)
+	if err == nil {
+		err = os.Rename(path+".tmp", path)
+	}
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "atm serve:", err) // its log; the run goes on
+	}
+}
+
+// Start checks args, atm run's command line, and what the run stands on, its preflight, and has the background
+// process of the repository at root run it. It returns the run, just started. A run that resumes another takes
+// that one's issue and base ref, and its agent's harness arguments are checked too.
+func Start(root string, args []string) (Outcome, error) {
+	args, base, resume, a, err := parseArgs(args)
+	var p resumePoint
+	var sha string
+	if err == nil && *resume != "" {
+		if p, err = resumeFrom(root, *resume); err == nil {
+			args, _, _, _, err = parseArgs(append(args, p.Issue)) // and no other
+			*base = p.BaseRef
+		}
+	}
+	if err == nil {
+		sha, err = preflight(root, *base, p, a, append(a.args, p.Args...))
+	}
+	if err != nil {
+		return Outcome{}, err
+	}
+	if a.systemPromptFile != "" {
+		args = append(slices.Clone(args[:len(args)-1]), "--system-prompt", a.systemPrompt.File, args[len(args)-1])
+	}
+	if _, err := strconv.Atoi(args[len(args)-1]); err != nil { // a file, which the background process reads from root
+		if args[len(args)-1], err = filepath.Abs(args[len(args)-1]); err != nil {
+			return Outcome{}, err
+		}
+	}
+	var o Outcome
+	err = call(root, request{Cmd: "run", Args: args, BaseSHA: sha}, nil, func(r reply) { o = *r.Run })
+	return o, err
+}
+
+// Attach copies the plain screen of run label, the last one that runs when label is "", to w until it ends,
+// and returns how it ended. Leaving leaves the run going.
+func Attach(root, label string, w io.Writer) (Outcome, error) {
+	return Follow(root, label, nil, func(f Frame) {
+		if f.Line != nil {
+			_, _ = fmt.Fprintln(w, *f.Line)
+		}
+	})
+}
+
+// Follow hands fn each frame of the screen of run label, as Attach, until it ends or leave closes, and returns
+// how it ended.
+func Follow(root, label string, leave <-chan struct{}, fn func(Frame)) (Outcome, error) {
+	return FollowFrom(root, label, 0, leave, fn)
+}
+
+// FollowFrom is Follow from frame from on, for a screen that already has the frames before it.
+func FollowFrom(root, label string, from int, leave <-chan struct{}, fn func(Frame)) (Outcome, error) {
+	var o Outcome
+	err := call(root, request{Cmd: "attach", Run: label, From: from}, leave, func(r reply) {
+		if r.Line != nil || r.Event != nil {
+			fn(r.Frame)
+		}
+		if r.Run != nil {
+			o = *r.Run
+		}
+	})
+	if err == nil && o.Ended.IsZero() && o.Outcome != "waiting" {
+		err = errors.New("the background process ended before the run did")
+	}
+	return o, err
+}
+
+// Runs is every run the background process of the repository at root knows, oldest first.
+func Runs(root string) ([]Outcome, error) {
+	var runs []Outcome
+	err := call(root, request{Cmd: "runs"}, nil, func(r reply) { runs = r.Runs })
+	return runs, err
+}
+
+// call sends req to the background process of the repository at root, started if need be, and hands each
+// reply to fn until leave closes. One that ends before it replies, as one whose file changed does, gets
+// req again from the next one.
+func call(root string, req request, leave <-chan struct{}, fn func(reply)) error {
+	delay := 200 * time.Millisecond
+	for {
+		again, err := send(root, req, leave, fn)
+		if !again {
+			return err
+		}
+		time.Sleep(delay)
+		delay = min(delay*2, 2*time.Second)
+	}
+}
+
+// send is a try of call: again when the background process it reached ended before it replied.
+func send(root string, req request, leave <-chan struct{}, fn func(reply)) (again bool, err error) {
+	c, err := connect(root)
+	if err != nil {
+		return false, err
+	}
+	defer func() { _ = c.Close() }()
+	if req.Cmd == "run" {
+		if again, err := matchingServe(root, c); again || err != nil {
+			return again, err
+		}
+	}
+	return exchange(c, req, leave, fn)
+}
+
+func exchange(c net.Conn, req request, leave <-chan struct{}, fn func(reply)) (again bool, err error) {
+	if err := json.NewEncoder(c).Encode(req); err != nil {
+		return true, err
+	}
+	done, left := make(chan struct{}), make(chan struct{}) // left: leave closed, the caller left
+	defer close(done)
+	go func() {
+		select {
+		case <-leave: // never, when leave is nil
+			close(left)
+			_ = c.Close()
+		case <-done:
+		}
+	}()
+	dec := json.NewDecoder(c)
+	for replied := false; ; replied = true {
+		var r reply
+		err := dec.Decode(&r)
+		select {
+		case <-left: // no try again
+			return false, nil
+		default:
+		}
+		if errors.Is(err, io.EOF) {
+			return !replied, nil
+		} else if err != nil {
+			return !replied, err
+		}
+		if r.Error != "" {
+			return false, errors.New(r.Error)
+		}
+		fn(r)
+		// Attach's final Run is authoritative.
+		if req.Cmd != "attach" || r.Run != nil {
+			return false, nil
+		}
+	}
+}
+
+// connect dials the background process of the repository at root, starting it when none answers. It logs to
+// .atm/serve.log.
+func connect(root string) (net.Conn, error) {
+	sock := socket(root)
+	if c, err := net.Dial("unix", short(sock)); err == nil {
+		return c, nil
+	}
+	exe, err := os.Executable()
+	if err == nil {
+		err = os.MkdirAll(filepath.Dir(sock), 0o755)
+	}
+	if err != nil {
+		return nil, err
+	}
+	log, err := os.OpenFile(filepath.Join(root, ".atm", "serve.log"), os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o644)
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = log.Close() }()
+	cmd := exec.Command(exe, "serve")
+	cmd.Dir, cmd.Stdout, cmd.Stderr = root, log, log
+	detach(cmd)
+	if err := cmd.Start(); err != nil {
+		return nil, err
+	}
+	exited := make(chan error, 1)
+	go func() { exited <- cmd.Wait() }()
+	for deadline := time.Now().Add(10 * time.Second); ; time.Sleep(20 * time.Millisecond) {
+		if c, err := net.Dial("unix", short(sock)); err == nil {
+			return c, nil
+		}
+		select {
+		case <-exited: // it lost to another one, which answers, or it failed
+			if c, err := net.Dial("unix", short(sock)); err == nil {
+				return c, nil
+			}
+			return nil, fmt.Errorf("the background process ended: see %s", log.Name())
+		default:
+		}
+		if time.Now().After(deadline) {
+			return nil, fmt.Errorf("the background process does not answer: see %s", log.Name())
+		}
+	}
+}

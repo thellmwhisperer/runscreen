@@ -1,0 +1,42 @@
+Read `AGENTS.md` at the clone root if it exists. Where it and this brief disagree, this brief wins.
+
+# Brief
+
+## GOAL
+The issue, verbatim:
+
+### {{.Title}}
+
+{{.Body}}
+
+## SCOPE
+- Edit project files only inside this clone, your working directory.
+- Read, search and run only inside this clone; you may also read and write your scratch directory below.
+  Never access the repository around it, the rest of `.atm/runs/` or another clone.
+- No network, except the project's package manager installing a dependency.
+- Your scratch directory, outside the clone, is `{{.Scratch}}`, your `$TMPDIR`: logs, outputs and files you set
+  aside go there, never in the system temp directory.
+- Test files are those matching {{code .TestPatterns}}. Docs files are those matching {{code .DocsPatterns}}.
+  Every other file is source.
+
+## ACCEPTANCE
+1. Implement the issue and cover the changed behaviour with tests.
+2. Then every command in VERIFY passes.
+
+## VERIFY
+- Test: the tests of each package you changed; not the whole suite, which ATM runs after you.
+- Typecheck: {{cmd .Typecheck}}
+- Lint: {{cmd .Lint}}
+
+## FORBIDDEN
+- Anything the issue does not ask for. A real behaviour gap you see and do not fix goes in your report's
+  summary, as a note.
+- `git commit`, `git push`, `git rebase`, any `gh` command.
+- `sleep` in tests.
+- Deleting or shortening an existing test, subtest or assertion. A test the change invalidates is updated to
+  expect the new behaviour. The only exception is a test the issue names as one to remove.
+
+## REPORT
+Write `summary` in Markdown, not HTML.
+Your final message must be ONLY this JSON object, nothing else:
+{"test_file": "<repo-relative path of the new test, or empty>", "changed_files": ["<path>"], "summary": "<one paragraph>", "commands_run": ["<command>"]}

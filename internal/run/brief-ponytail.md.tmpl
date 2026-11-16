@@ -1,0 +1,45 @@
+Read `AGENTS.md` at the clone root if it exists. Where it and this brief disagree, this brief wins.
+
+# Ponytail pass
+
+## GOAL
+The diff below did this issue and passed every check. Cut what the issue does not need from it, including
+anything the issue did not ask for. If nothing is worth cutting, change nothing.
+
+### {{.Title}}
+
+{{.Body}}
+
+## RULES
+Use the `ponytail-review` skill, and make its cuts yourself: this brief wins over its "only lists them".
+- Never cut code that does what a sentence of the issue asks, in its goal, acceptance criteria or invariants,
+  even when no test covers it. When unsure whether the issue needs a line, keep it.
+- You may only cut: delete, shrink, or replace with the standard library or a helper that already exists in
+  this repository.
+- Only files in the diff, no new files.
+{{if .Tests}}- Do not change {{code .Tests}}: the test the worker reported as its proof stays byte for byte, and ATM throws the whole
+  cut away if it changes.
+{{end}}- ATM runs every check again and throws the cut away if one fails or the diff does not get shorter:
+  - Test: {{cmd .Test}}
+  - Typecheck: {{cmd .Typecheck}}
+  - Lint: {{cmd .Lint}}
+
+## SCOPE
+- Read, search and run only inside this clone: never the repository around it, `.atm/runs/` or another clone.
+- No network, except the project's package manager installing a dependency.
+
+## FORBIDDEN
+- `git commit`, `git push`, `git rebase`, any `gh` command.
+- Writing or changing files through shell commands (heredocs, `cat >`, `sed -i`, `python -c` and the like). Use your edit and write tools.
+- A URL inside any shell command. ATM ends the run on it, even with no network access. A URL may appear only in files written with your edit tools.
+- Running a command in the background, or ending your turn while one runs. Run every command in the foreground. Your turn ends only with the report.
+
+## DIFF
+```diff
+{{.Diff}}
+```
+
+## REPORT
+Your final message must be ONLY this JSON object, nothing else, one finding per cut you made:
+{"findings": [{"file": "<repo-relative path in the diff>", "family": "<its slop family>", "finding": "<one line: what you cut and what replaces it>", "issue_sentence": "<the sentence of the issue the cut touches, or empty>"}], "summary": "<one paragraph>"}
+The family is one of {{code .Families}}. Use `"issue_sentence": ""` only when the cut touches no sentence of the issue. Use `"findings": []` when you cut nothing.

@@ -1,0 +1,148 @@
+package tui
+
+import (
+	"errors"
+	"fmt"
+	"io"
+	"os"
+	"strings"
+	"time"
+
+	tea "github.com/charmbracelet/bubbletea"
+	"github.com/charmbracelet/x/ansi"
+	"golang.org/x/term"
+
+	"github.com/thellmwhisperer/runscreen/internal/config"
+	"github.com/thellmwhisperer/runscreen/internal/run"
+)
+
+var follow = run.FollowFrom // tests follow a run of their own
+
+// Show shows the screen of run label, of the repository at root, on the terminal in and out until the user
+// closes it or, with screen: close, the run and its gate end; detached when the user left it going.
+// The screen keeps the terminal all along: Delivery's command runs
+// below it, and the gate shows in its pipeline.
+func Show(root, label string, in, out *os.File) (o run.Outcome, detached bool, err error) {
+	label, err = resolve(root, label)
+	if err != nil {
+		return o, false, err
+	}
+	if label == "" {
+		return o, false, errors.New("no run yet")
+	}
+	w, h, err := term.GetSize(int(out.Fd()))
+	if err != nil {
+		return o, false, err
+	}
+	m := runScreen(root, label, w, h)
+	m.keepScreen, err = config.KeepScreen(os.Getenv("HOME"))
+	if err != nil {
+		return o, false, err
+	}
+	archived := m.done
+	p := tea.NewProgram(m, tea.WithInput(in), tea.WithOutput(out), tea.WithAltScreen(), tea.WithMouseCellMotion())
+	leave, done := make(chan struct{}), make(chan struct{})
+	go func() {
+		defer close(done)
+		if archived {
+			return
+		}
+		// A run that waits for its launcher's answer is not over: the screen follows it again, from the frame
+		// after the last it has, once a second, until it goes on or ends.
+		for seen := 0; ; {
+			o, err := follow(root, label, seen, leave, func(f run.Frame) { seen++; p.Send(f) })
+			if err != nil || !o.Waits() {
+				p.Send(ended{o, err})
+				return
+			}
+			p.Send(o)
+			select {
+			case <-leave:
+				return
+			case <-time.After(time.Second):
+			}
+		}
+	}()
+	// A terminal can give a grapheme more columns than the renderer does. Do not let
+	// its automatic wrap move later rows and leave an earlier footer on screen.
+	_, _ = fmt.Fprint(out, ansi.ResetAutoWrapMode)
+	_, err = p.Run()
+	_, _ = fmt.Fprint(out, ansi.SetAutoWrapMode)
+	close(leave)
+	<-done
+	if err != nil {
+		return o, false, err
+	}
+	_, _ = fmt.Fprintln(out, m.View()) // the alternate screen is gone: the last one stays
+	return m.outcome, m.detached, m.err
+}
+
+// runScreen restores an ended run without its daemon or clone; a live run starts with its configured gate pending.
+func runScreen(root, label string, width, height int) *Model {
+	m := New(label, width, height)
+	runs, _ := run.RecordedRuns(root)
+	for _, r := range runs {
+		if r.Run != label {
+			continue
+		}
+		if !r.Ended.IsZero() {
+			m.end(r, nil)
+			if d := m.current("delivery"); d.state == "passed" || d.state == "failed" {
+				m.gate(savedGate(r.Report))
+			}
+		} else if r.BaseSHA != "" {
+			c, _, _ := run.BaseConfig(root, r.BaseSHA, os.Getenv("HOME"), config.Agent{})
+			m.skipPonytail(!c.Ponytail)
+			if c.Delivery != "" {
+				for _, name := range gateNames {
+					m.rows = append(m.rows, &row{step: "gate:" + name, label: name, state: "pending"})
+				}
+			}
+		}
+		break
+	}
+	return m
+}
+
+// Attach shows run label's plain lines on w until it ends.
+func Attach(root, label string, w io.Writer) (run.Outcome, error) {
+	label, err := resolve(root, label)
+	if err != nil {
+		return run.Outcome{}, err
+	}
+	if label == "" {
+		return run.Outcome{}, errors.New("no run yet")
+	}
+	if m := runScreen(root, label, 0, 0); m.done {
+		for _, r := range m.rows {
+			how := "-"
+			if r.hasDuration {
+				how = run.Human(r.took)
+			}
+			_, _ = fmt.Fprintf(w, "%s  %s  %s  %s\n", strings.ToLower(r.label), states[r.state][0], how, r.state)
+		}
+		_, _ = fmt.Fprintf(w, "RESULT  %s\nreport  %s\n", m.outcome.Outcome, m.outcome.Report)
+		return m.outcome, nil
+	}
+	return run.Attach(root, label, w)
+}
+
+// resolve chooses the run that an empty-label attach will follow, once.
+func resolve(root, label string) (string, error) {
+	if label != "" {
+		return label, nil
+	}
+	runs, err := run.Runs(root)
+	if err != nil {
+		return "", err
+	}
+	for i := len(runs) - 1; i >= 0; i-- {
+		if runs[i].Ended.IsZero() {
+			return runs[i].Run, nil
+		}
+	}
+	if len(runs) > 0 {
+		return runs[len(runs)-1].Run, nil
+	}
+	return "", nil
+}
